@@ -2363,3 +2363,5 @@ func exludeBlocksPendingUpload(logger *slog.Logger, uploadMetaPath string) tsdb.
 		return !slices.Contains(uploadMeta.Uploaded, meta.ULID.String())
 	}
 }
+
+// lab: PR experiment 2026-10-21T16:32:11Z
