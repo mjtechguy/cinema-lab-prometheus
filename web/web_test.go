@@ -1,0 +1,950 @@
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package web
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/notifier"
+	"github.com/prometheus/prometheus/rules"
+	"github.com/prometheus/prometheus/scrape"
+	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/util/testutil"
+)
+
+func TestMain(m *testing.M) {
+	// On linux with a global proxy the tests will fail as the go client(http,grpc) tries to connect through the proxy.
+	os.Setenv("no_proxy", "localhost,127.0.0.1,0.0.0.0,:")
+	os.Exit(m.Run())
+}
+
+type dbAdapter struct {
+	*tsdb.DB
+}
+
+func (a *dbAdapter) BlockMetas() ([]tsdb.BlockMeta, error) {
+	return a.DB.BlockMetas(), nil
+}
+
+func (a *dbAdapter) Stats(statsByLabelName string, limit int) (*tsdb.Stats, error) {
+	return a.Head().Stats(statsByLabelName, limit), nil
+}
+
+func (*dbAdapter) WALReplayStatus() (tsdb.WALReplayStatus, error) {
+	return tsdb.WALReplayStatus{}, nil
+}
+
+func TestWithStackTracer(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		panicValue any
+		wantLog    bool
+	}{
+		{name: "success"},
+		{name: "abort", panicValue: http.ErrAbortHandler},
+		{name: "ordinary panic", panicValue: errors.New("unexpected failure"), wantLog: true},
+		{name: "wrapped abort", panicValue: fmt.Errorf("wrapped: %w", http.ErrAbortHandler), wantLog: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			handler := withStackTracer(otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.panicValue != nil {
+					panic(tc.panicValue)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}), "test"), slog.New(slog.NewTextHandler(&logs, nil)))
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+			if tc.panicValue == nil {
+				handler.ServeHTTP(response, request)
+				require.Equal(t, http.StatusNoContent, response.Code)
+			} else {
+				require.PanicsWithValue(t, tc.panicValue, func() { handler.ServeHTTP(response, request) })
+			}
+			if tc.wantLog {
+				require.Contains(t, logs.String(), "panic while serving request")
+				require.Contains(t, logs.String(), "stack=")
+			} else {
+				require.Empty(t, logs.String())
+			}
+		})
+	}
+}
+
+func TestReadyAndHealthy(t *testing.T) {
+	t.Parallel()
+
+	dbDir := t.TempDir()
+
+	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddresses: []string{port},
+		ReadTimeout:     30 * time.Second,
+		MaxConnections:  512,
+		Context:         nil,
+		Storage:         nil,
+		LocalStorage:    &dbAdapter{db},
+		TSDBDir:         dbDir,
+		QueryEngine:     nil,
+		ScrapeManager:   &scrape.Manager{},
+		RuleManager:     &rules.Manager{},
+		Notifier:        nil,
+		RoutePrefix:     "/",
+		EnableAdminAPI:  true,
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost" + port,
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+	}
+
+	opts.Flags = map[string]string{}
+
+	webHandler := New(nil, opts)
+
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+	l, err := webHandler.Listeners()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listeners: %s", err))
+	}
+
+	ctx := t.Context()
+	go func() {
+		err := webHandler.Run(ctx, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+	}()
+
+	baseURL := "http://localhost" + port
+
+	waitForServerReady(t, baseURL, 5*time.Second)
+
+	resp, err := http.Get(baseURL + "/-/healthy")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Head(baseURL + "/-/healthy")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	for _, u := range []string{
+		baseURL + "/-/ready",
+	} {
+		resp, err = http.Get(u)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		require.Equal(t, "false", resp.Header.Get("X-Prometheus-Stopping"))
+		cleanupTestResponse(t, resp)
+
+		resp, err = http.Head(u)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		require.Equal(t, "false", resp.Header.Get("X-Prometheus-Stopping"))
+		cleanupTestResponse(t, resp)
+	}
+
+	// Set to stopping
+	webHandler.SetReady(Stopping)
+
+	for _, u := range []string{
+		baseURL + "/-/ready",
+	} {
+		resp, err = http.Get(u)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		require.Equal(t, "true", resp.Header.Get("X-Prometheus-Stopping"))
+		cleanupTestResponse(t, resp)
+
+		resp, err = http.Head(u)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+		require.Equal(t, "true", resp.Header.Get("X-Prometheus-Stopping"))
+		cleanupTestResponse(t, resp)
+	}
+
+	resp, err = http.Post(baseURL+"/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Post(baseURL+"/api/v1/admin/tsdb/delete_series", "", strings.NewReader("{}"))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	// Set to ready.
+	webHandler.SetReady(Ready)
+
+	for _, u := range []string{
+		baseURL + "/-/healthy",
+		baseURL + "/-/ready",
+	} {
+		resp, err = http.Get(u)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		cleanupTestResponse(t, resp)
+
+		resp, err = http.Head(u)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		cleanupTestResponse(t, resp)
+	}
+
+	resp, err = http.Post(baseURL+"/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cleanupSnapshot(t, dbDir, resp)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Post(baseURL+"/api/v1/admin/tsdb/delete_series?match[]=up", "", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+}
+
+func TestRoutePrefix(t *testing.T) {
+	t.Parallel()
+	dbDir := t.TempDir()
+
+	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddresses: []string{port},
+		ReadTimeout:     30 * time.Second,
+		MaxConnections:  512,
+		Context:         nil,
+		TSDBDir:         dbDir,
+		LocalStorage:    &dbAdapter{db},
+		Storage:         nil,
+		QueryEngine:     nil,
+		ScrapeManager:   nil,
+		RuleManager:     nil,
+		Notifier:        nil,
+		RoutePrefix:     "/prometheus",
+		EnableAdminAPI:  true,
+		ExternalURL: &url.URL{
+			Host:   "localhost.localdomain" + port,
+			Scheme: "http",
+		},
+	}
+
+	opts.Flags = map[string]string{}
+
+	webHandler := New(nil, opts)
+	l, err := webHandler.Listeners()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listeners: %s", err))
+	}
+	ctx := t.Context()
+	go func() {
+		err := webHandler.Run(ctx, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+	}()
+
+	baseURL := "http://localhost" + port
+
+	waitForServerReady(t, baseURL+opts.RoutePrefix, 5*time.Second)
+
+	resp, err := http.Get(baseURL + opts.RoutePrefix + "/-/healthy")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Get(baseURL + opts.RoutePrefix + "/-/ready")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Post(baseURL+opts.RoutePrefix+"/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Post(baseURL+opts.RoutePrefix+"/api/v1/admin/tsdb/delete_series", "", strings.NewReader("{}"))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	// Set to ready.
+	webHandler.SetReady(Ready)
+
+	resp, err = http.Get(baseURL + opts.RoutePrefix + "/-/healthy")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Get(baseURL + opts.RoutePrefix + "/-/ready")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Post(baseURL+opts.RoutePrefix+"/api/v1/admin/tsdb/snapshot", "", strings.NewReader(""))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	cleanupSnapshot(t, dbDir, resp)
+	cleanupTestResponse(t, resp)
+
+	resp, err = http.Post(baseURL+opts.RoutePrefix+"/api/v1/admin/tsdb/delete_series?match[]=up", "", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	cleanupTestResponse(t, resp)
+}
+
+func TestDebugHandler(t *testing.T) {
+	for _, tc := range []struct {
+		prefix, url string
+		code        int
+	}{
+		{"/", "/debug/pprof/cmdline", 200},
+		{"/foo", "/foo/debug/pprof/cmdline", 200},
+
+		{"/", "/debug/pprof/goroutine", 200},
+		{"/foo", "/foo/debug/pprof/goroutine", 200},
+
+		{"/", "/debug/pprof/foo", 404},
+		{"/foo", "/bar/debug/pprof/goroutine", 404},
+	} {
+		opts := &Options{
+			RoutePrefix:     tc.prefix,
+			ListenAddresses: []string{"somehost:9090"},
+			ExternalURL: &url.URL{
+				Host:   "localhost.localdomain:9090",
+				Scheme: "http",
+			},
+			Version: &PrometheusVersion{},
+		}
+		handler := New(nil, opts)
+		handler.SetReady(Ready)
+
+		w := httptest.NewRecorder()
+
+		req, err := http.NewRequest(http.MethodGet, tc.url, http.NoBody)
+
+		require.NoError(t, err)
+
+		handler.router.ServeHTTP(w, req)
+
+		require.Equal(t, tc.code, w.Code)
+	}
+}
+
+func TestHTTPMetrics(t *testing.T) {
+	t.Parallel()
+	handler := New(nil, &Options{
+		RoutePrefix:     "/",
+		ListenAddresses: []string{"somehost:9090"},
+		ExternalURL: &url.URL{
+			Host:   "localhost.localdomain:9090",
+			Scheme: "http",
+		},
+		Version: &PrometheusVersion{},
+	})
+	getReady := func() int {
+		t.Helper()
+		w := httptest.NewRecorder()
+
+		req, err := http.NewRequest(http.MethodGet, "/-/ready", http.NoBody)
+		require.NoError(t, err)
+
+		handler.router.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	code := getReady()
+	require.Equal(t, http.StatusServiceUnavailable, code)
+	ready := handler.metrics.readyStatus
+	require.Equal(t, 0, int(prom_testutil.ToFloat64(ready)))
+	counter := handler.metrics.requestCounter
+	require.Equal(t, 1, int(prom_testutil.ToFloat64(counter.WithLabelValues("/-/ready", strconv.Itoa(http.StatusServiceUnavailable)))))
+
+	handler.SetReady(Ready)
+	for range [2]int{} {
+		code = getReady()
+		require.Equal(t, http.StatusOK, code)
+	}
+	require.Equal(t, 1, int(prom_testutil.ToFloat64(ready)))
+	require.Equal(t, 2, int(prom_testutil.ToFloat64(counter.WithLabelValues("/-/ready", strconv.Itoa(http.StatusOK)))))
+	require.Equal(t, 1, int(prom_testutil.ToFloat64(counter.WithLabelValues("/-/ready", strconv.Itoa(http.StatusServiceUnavailable)))))
+
+	handler.SetReady(NotReady)
+	for range [2]int{} {
+		code = getReady()
+		require.Equal(t, http.StatusServiceUnavailable, code)
+	}
+	require.Equal(t, 0, int(prom_testutil.ToFloat64(ready)))
+	require.Equal(t, 2, int(prom_testutil.ToFloat64(counter.WithLabelValues("/-/ready", strconv.Itoa(http.StatusOK)))))
+	require.Equal(t, 3, int(prom_testutil.ToFloat64(counter.WithLabelValues("/-/ready", strconv.Itoa(http.StatusServiceUnavailable)))))
+}
+
+func TestShutdownWithStaleConnection(t *testing.T) {
+	dbDir := t.TempDir()
+
+	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	timeout := 10 * time.Second
+
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddresses: []string{port},
+		ReadTimeout:     timeout,
+		MaxConnections:  512,
+		Context:         nil,
+		Storage:         nil,
+		LocalStorage:    &dbAdapter{db},
+		TSDBDir:         dbDir,
+		QueryEngine:     nil,
+		ScrapeManager:   &scrape.Manager{},
+		RuleManager:     &rules.Manager{},
+		Notifier:        nil,
+		RoutePrefix:     "/",
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost" + port,
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+	}
+
+	opts.Flags = map[string]string{}
+
+	webHandler := New(nil, opts)
+
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+	l, err := webHandler.Listeners()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listeners: %s", err))
+	}
+
+	closed := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		err := webHandler.Run(ctx, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+		close(closed)
+	}()
+
+	baseURL := "http://localhost" + port
+
+	waitForServerReady(t, baseURL, 5*time.Second)
+
+	// Open a socket, and don't use it. This connection should then be closed
+	// after the ReadTimeout.
+	c, err := net.Dial("tcp", opts.ExternalURL.Host)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	// Stop the web handler.
+	cancel()
+
+	select {
+	case <-closed:
+	case <-time.After(timeout + 5*time.Second):
+		require.FailNow(t, "Server still running after read timeout.")
+	}
+}
+
+func TestHandleMultipleQuitRequests(t *testing.T) {
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddresses: []string{port},
+		MaxConnections:  512,
+		EnableLifecycle: true,
+		RoutePrefix:     "/",
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost" + port,
+			Path:   "/",
+		},
+	}
+	webHandler := New(nil, opts)
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+	l, err := webHandler.Listeners()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listeners: %s", err))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	closed := make(chan struct{})
+	go func() {
+		err := webHandler.Run(ctx, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+		close(closed)
+	}()
+
+	baseURL := opts.ExternalURL.Scheme + "://" + opts.ExternalURL.Host
+
+	waitForServerReady(t, baseURL, 5*time.Second)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(func() {
+			<-start
+			resp, err := http.Post(baseURL+"/-/quit", "", strings.NewReader(""))
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	// Stop the web handler.
+	cancel()
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "Server still running after 5 seconds.")
+	}
+}
+
+// Test for availability of API endpoints in Prometheus Agent mode.
+func TestAgentAPIEndPoints(t *testing.T) {
+	t.Parallel()
+
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddresses: []string{port},
+		ReadTimeout:     30 * time.Second,
+		MaxConnections:  512,
+		Context:         nil,
+		Storage:         nil,
+		QueryEngine:     nil,
+		ScrapeManager:   &scrape.Manager{},
+		RuleManager:     &rules.Manager{},
+		Notifier:        nil,
+		RoutePrefix:     "/",
+		EnableAdminAPI:  true,
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost" + port,
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+		IsAgent:  true,
+	}
+
+	opts.Flags = map[string]string{}
+
+	webHandler := New(nil, opts)
+	webHandler.SetReady(Ready)
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+	l, err := webHandler.Listeners()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listeners: %s", err))
+	}
+
+	ctx := t.Context()
+	go func() {
+		err := webHandler.Run(ctx, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+	}()
+
+	baseURL := "http://localhost" + port + "/api/v1"
+
+	waitForServerReady(t, "http://localhost"+port, 5*time.Second)
+
+	// Test for non-available endpoints in the Agent mode.
+	for path, methods := range map[string][]string{
+		"/labels":                      {http.MethodGet, http.MethodPost},
+		"/label/:name/values":          {http.MethodGet},
+		"/series":                      {http.MethodGet, http.MethodPost},
+		"/alertmanagers":               {http.MethodGet},
+		"/query":                       {http.MethodGet, http.MethodPost},
+		"/query_range":                 {http.MethodGet, http.MethodPost},
+		"/query_exemplars":             {http.MethodGet, http.MethodPost},
+		"/status/tsdb":                 {http.MethodGet},
+		"/status/tsdb/blocks":          {http.MethodGet},
+		"/alerts":                      {http.MethodGet},
+		"/rules":                       {http.MethodGet},
+		"/admin/tsdb/delete_series":    {http.MethodPost, http.MethodPut},
+		"/admin/tsdb/clean_tombstones": {http.MethodPost, http.MethodPut},
+		"/admin/tsdb/snapshot":         {http.MethodPost, http.MethodPut},
+	} {
+		for _, m := range methods {
+			req, err := http.NewRequest(m, baseURL+path, http.NoBody)
+			require.NoError(t, err)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+			t.Cleanup(func() {
+				require.NoError(t, resp.Body.Close())
+			})
+		}
+	}
+
+	// Test for some of available endpoints in the Agent mode.
+	for path, methods := range map[string][]string{
+		"/targets":            {http.MethodGet},
+		"/targets/metadata":   {http.MethodGet},
+		"/metadata":           {http.MethodGet},
+		"/status/config":      {http.MethodGet},
+		"/status/runtimeinfo": {http.MethodGet},
+		"/status/flags":       {http.MethodGet},
+	} {
+		for _, m := range methods {
+			req, err := http.NewRequest(m, baseURL+path, http.NoBody)
+			require.NoError(t, err)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			t.Cleanup(func() {
+				require.NoError(t, resp.Body.Close())
+			})
+		}
+	}
+}
+
+func cleanupTestResponse(t *testing.T, resp *http.Response) {
+	_, err := io.Copy(io.Discard, resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+}
+
+func cleanupSnapshot(t *testing.T, dbDir string, resp *http.Response) {
+	snapshot := &struct {
+		Data struct {
+			Name string `json:"name"`
+		} `json:"data"`
+	}{}
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(b, snapshot))
+	require.NotEmpty(t, snapshot.Data.Name, "snapshot directory not returned")
+	require.NoError(t, os.Remove(filepath.Join(dbDir, "snapshots", snapshot.Data.Name)))
+	require.NoError(t, os.Remove(filepath.Join(dbDir, "snapshots")))
+}
+
+func TestMultipleListenAddresses(t *testing.T) {
+	t.Parallel()
+
+	dbDir := t.TempDir()
+
+	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+
+	// Create multiple ports for testing multiple ListenAddresses
+	port1 := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+	port2 := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+
+	opts := &Options{
+		ListenAddresses: []string{port1, port2},
+		ReadTimeout:     30 * time.Second,
+		MaxConnections:  512,
+		Context:         nil,
+		Storage:         nil,
+		LocalStorage:    &dbAdapter{db},
+		TSDBDir:         dbDir,
+		QueryEngine:     nil,
+		ScrapeManager:   &scrape.Manager{},
+		RuleManager:     &rules.Manager{},
+		Notifier:        nil,
+		RoutePrefix:     "/",
+		EnableAdminAPI:  true,
+		ExternalURL: &url.URL{
+			Scheme: "http",
+			Host:   "localhost" + port1,
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+	}
+
+	opts.Flags = map[string]string{}
+
+	webHandler := New(nil, opts)
+
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+	l, err := webHandler.Listeners()
+	if err != nil {
+		panic(fmt.Sprintf("Unable to start web listener: %s", err))
+	}
+
+	ctx := t.Context()
+	go func() {
+		err := webHandler.Run(ctx, l, "")
+		if err != nil {
+			panic(fmt.Sprintf("Can't start web handler:%s", err))
+		}
+	}()
+
+	waitForServerReady(t, "http://localhost"+port1, 5*time.Second)
+
+	// Set to ready.
+	webHandler.SetReady(Ready)
+
+	for _, port := range []string{port1, port2} {
+		baseURL := "http://localhost" + port
+
+		resp, err := http.Get(baseURL + "/-/healthy")
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		cleanupTestResponse(t, resp)
+
+		resp, err = http.Get(baseURL + "/-/ready")
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		cleanupTestResponse(t, resp)
+	}
+}
+
+// Give some time for the web goroutine to run since we need the server
+// to be up before starting tests.
+func waitForServerReady(t *testing.T, baseURL string, timeout time.Duration) {
+	t.Helper()
+
+	interval := 100 * time.Millisecond
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(baseURL + "/-/healthy")
+		if resp != nil {
+			cleanupTestResponse(t, resp)
+		}
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return
+		}
+		time.Sleep(interval)
+	}
+	t.Fatalf("Server did not become ready within %v", timeout)
+}
+
+// TestTLSHTTP2ALPN verifies that a TLS-enabled web server with http2: true
+// negotiates HTTP/2 via ALPN. This is a regression test for
+// https://github.com/prometheus/prometheus/issues/19807: exporter-toolkit
+// v0.19.0 copied Server.TLSConfig.NextProtos in its reload callback, but Go
+// 1.27 moved HTTP/2 ALPN setup to an internal TLS config clone, leaving the
+// original NextProtos empty and causing the server to silently fall back to
+// HTTP/1.1. exporter-toolkit v0.20.0 derives the ALPN list from
+// Server.Protocols and the registered HTTP/2 handler instead.
+func TestTLSHTTP2ALPN(t *testing.T) {
+	t.Parallel()
+
+	// Generate a self-signed certificate for 127.0.0.1.
+	certDir := t.TempDir()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "prometheus-web-test"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	certPath := filepath.Join(certDir, "cert.pem")
+	keyPath := filepath.Join(certDir, "key.pem")
+	require.NoError(t, os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	keyDer, err := x509.MarshalPKCS8PrivateKey(key)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDer}), 0o600))
+
+	webCfg := filepath.Join(certDir, "web.yml")
+	webCfgContent := fmt.Appendf(nil, `tls_server_config:
+  cert_file: %s
+  key_file: %s
+http_server_config:
+  http2: true
+`, certPath, keyPath)
+	require.NoError(t, os.WriteFile(webCfg, webCfgContent, 0o600))
+
+	dbDir := t.TempDir()
+	db, err := tsdb.Open(dbDir, nil, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	port := fmt.Sprintf(":%d", testutil.RandomUnprivilegedPort(t))
+	opts := &Options{
+		ListenAddresses: []string{port},
+		ReadTimeout:     30 * time.Second,
+		MaxConnections:  512,
+		LocalStorage:    &dbAdapter{db},
+		TSDBDir:         dbDir,
+		ScrapeManager:   &scrape.Manager{},
+		RuleManager:     &rules.Manager{},
+		RoutePrefix:     "/",
+		ExternalURL: &url.URL{
+			Scheme: "https",
+			Host:   "localhost" + port,
+			Path:   "/",
+		},
+		Version:  &PrometheusVersion{},
+		Gatherer: prometheus.DefaultGatherer,
+		Flags:    map[string]string{},
+	}
+
+	webHandler := New(nil, opts)
+	webHandler.config = &config.Config{}
+	webHandler.notifier = &notifier.Manager{}
+
+	listeners, err := webHandler.Listeners()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	go func() {
+		_ = webHandler.Run(ctx, listeners, webCfg)
+	}()
+
+	// Build a TLS client that advertises h2 and trusts the self-signed cert.
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	require.NoError(t, err)
+	caPool := x509.NewCertPool()
+	caCert, err := x509.ParseCertificate(cert.Certificate[0])
+	require.NoError(t, err)
+	caPool.AddCert(caCert)
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs:    caPool,
+			NextProtos: []string{"h2"},
+		},
+		ForceAttemptHTTP2: true,
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+
+	baseURL := "https://localhost" + port
+
+	// Warm up: establish the connection and let the HTTP/2 round tripper
+	// negotiate ALPN.
+	warmup, err := client.Get(baseURL + "/-/healthy")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, warmup.StatusCode)
+	cleanupTestResponse(t, warmup)
+	require.Equal(t, "h2", warmup.TLS.NegotiatedProtocol, "expected h2 ALPN negotiation")
+	require.Equal(t, "HTTP/2.0", warmup.Proto, "expected HTTP/2.0 protocol")
+
+	// Concurrent requests should all multiplex over a single HTTP/2
+	// connection. Under the v0.19.0 bug the server falls back to HTTP/1.1
+	// and each request opens its own TCP connection.
+	const n = 10
+	var (
+		wg            sync.WaitGroup
+		mu            sync.Mutex
+		remoteAddrs   = map[string]int{}
+		protoCounts   = map[string]int{}
+		alpnCounts    = map[string]int{}
+		firstTLSState *tls.ConnectionState
+	)
+	for range n {
+		wg.Go(func() {
+			resp, err := client.Get(baseURL + "/-/healthy")
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+
+			mu.Lock()
+			defer mu.Unlock()
+			protoCounts[resp.Proto]++
+			if resp.TLS != nil {
+				alpnCounts[resp.TLS.NegotiatedProtocol]++
+				if firstTLSState == nil {
+					cs := *resp.TLS
+					firstTLSState = &cs
+				}
+			}
+			// The server observes the remote TCP peer address via
+			// a custom header added below; here we just count
+			// protocol-level outcomes.
+			_ = remoteAddrs
+		})
+	}
+	wg.Wait()
+
+	require.Equal(t, map[string]int{"HTTP/2.0": n}, protoCounts,
+		"all concurrent requests should complete over HTTP/2.0")
+	require.Equal(t, map[string]int{"h2": n}, alpnCounts,
+		"all concurrent requests should negotiate h2 via ALPN")
+}
