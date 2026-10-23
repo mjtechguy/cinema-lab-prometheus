@@ -1,108 +1,316 @@
-# prometheus CI (PR) → CInema tasks: the test_go / test_go_more / test_go_386 /
-# golangci / check_generated_parser / test_ui / compliance work. Fuzzing (4 parallel
-# 4-minute jobs, never reusable) and jobs that download floating tools stay in
-# upstream's workflows: inside one gate job they'd only add serial time.
+# Drafted by `cinema analyze` from .github/workflows. Not reviewed: every task must
+# pass `cinema run --commit HEAD <id>` and agree with CI before it counts for anything.
 schema_version: 1
 tasks:
-  style:
-    argv: [bash, -c, "r=$(gofmt -d $(git ls-files '*.go' ':!:vendor/*')); [ -z \"$r\" ] || { echo \"$r\"; exit 1; }"]
-    platform: any
-    toolchain: [{cmd: [go, version]}]
-    reuse: { allowed: true, max_age: 72h }
-  check-license:
-    argv: [bash, -c, "r=$(for f in $(git ls-files '*.go' ':!:vendor/*'); do awk 'NR<=3' \"$f\" | grep -Eq '(Copyright|generated|GENERATED)' || echo \"$f\"; done); [ -z \"$r\" ] || { echo \"$r\"; exit 1; }"]
-    platform: any
-    toolchain: []
-    reuse: { allowed: true, max_age: 72h }
-  go-mod-tidy:
-    argv: [bash, -o, pipefail, -c, "go mod tidy && git diff --exit-code -- go.sum go.mod"]
-    platform: any
-    toolchain: [{cmd: [go, version]}]
-    reuse: { allowed: true, max_age: 72h }
-  test-race:
-    argv: [go, test, -race, -count=1, ./...]
+  # ci.yml: check_generated_parser
+  # REVIEW: runs in a container (quay.io/prometheus/golang-builder:1.27-base): run the steps inside it, e.g. docker run, and fingerprint the image
+  # REVIEW: uses action prometheus/promci-setup@55bd31fe92710532260eb57c554f2697363285c5: no local equivalent known; reproduce it with commands
+  check-generated-parser:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        make install-goyacc check-generated-parser
+        )
+        (
+        make check-generated-promql-functions
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [CGO_ENABLED, GOFLAGS, GOEXPERIMENT]
-    reuse: { allowed: true, max_age: 72h }
-  tsdb-no-isolation:
-    argv: [go, test, -count=1, ./tsdb/, -test.tsdb-isolation=false]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: golangci
+  # REVIEW: a step is conditional (if: github.repository == 'prometheus/snmp_exporter'); it is included unconditionally
+  # REVIEW: a step uses sudo (installs or changes the machine): make it a prerequisite of the evidence machine, not part of the task
+  # REVIEW: uses action golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a: no local equivalent known; reproduce it with commands
+  # REVIEW: uses action golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a: no local equivalent known; reproduce it with commands
+  # REVIEW: uses action golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a: no local equivalent known; reproduce it with commands
+  # REVIEW: uses action golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a: no local equivalent known; reproduce it with commands
+  # REVIEW: uses action golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a: no local equivalent known; reproduce it with commands
+  # NOTE: Go "1.27.x" resolved to 1.27.3, the newest matching release today: CI will move on; this pin won't
+  # NOTE: $GITHUB_ENV, $GITHUB_PATH and $GITHUB_OUTPUT are emulated with temp files, loaded before each step
+  golangci:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        export GITHUB_ENV=$(mktemp) GITHUB_PATH=$(mktemp) GITHUB_OUTPUT=$(mktemp) GITHUB_STEP_SUMMARY=/dev/null
+        trap 'rm -f "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT"' EXIT
+        _gh_load() {
+          local l n d v x p
+          while IFS= read -r l; do
+            n=${l%%=*}
+            if [[ $n == *'<<'* ]]; then
+              n=${l%%<<*} d=${l#*<<} v=
+              while IFS= read -r x && [[ $x != "$d" ]]; do v+=${v:+$'\n'}$x; done
+              export "$n=$v"
+            elif [[ $l == *=* ]]; then
+              export "$n=${l#*=}"
+            fi
+          done <"$GITHUB_ENV"
+          while IFS= read -r p; do [[ -n $p ]] && PATH=$p:$PATH; done <"$GITHUB_PATH"
+        }
+        (
+        sudo apt-get update && sudo apt-get -y install libsnmp-dev
+        )
+        (
+          _gh_load
+        echo "version=$(make print-golangci-lint-version)" >> $GITHUB_OUTPUT
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [CGO_ENABLED, GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  dedupelabels:
-    argv: [go, test, -count=1, -tags=dedupelabels, ./...]
+    runtime: {go: 1.27.3}
+    toolchain:
+      - {cmd: [go, version]}
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: list_lts_releases
+  # NOTE: $GITHUB_ENV, $GITHUB_PATH and $GITHUB_OUTPUT are emulated with temp files, loaded before each step
+  list-lts-releases:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        export GITHUB_ENV=$(mktemp) GITHUB_PATH=$(mktemp) GITHUB_OUTPUT=$(mktemp) GITHUB_STEP_SUMMARY=/dev/null
+        trap 'rm -f "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT"' EXIT
+        _gh_load() {
+          local l n d v x p
+          while IFS= read -r l; do
+            n=${l%%=*}
+            if [[ $n == *'<<'* ]]; then
+              n=${l%%<<*} d=${l#*<<} v=
+              while IFS= read -r x && [[ $x != "$d" ]]; do v+=${v:+$'\n'}$x; done
+              export "$n=$v"
+            elif [[ $l == *=* ]]; then
+              export "$n=${l#*=}"
+            fi
+          done <"$GITHUB_ENV"
+          while IFS= read -r p; do [[ -n $p ]] && PATH=$p:$PATH; done <"$GITHUB_PATH"
+        }
+        (
+          _gh_load
+        versions=$(curl -sSf https://prometheus.io/download.json \
+          | jq -c '[.prometheus[] | select(.lts == true) | (.version | ltrimstr("v"))]')
+        echo "versions=$versions" >> "$GITHUB_OUTPUT"
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [CGO_ENABLED, GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  slicelabels-race:
-    argv: [go, test, -count=1, -tags=slicelabels, -race, ./cmd/prometheus, ./cmd/promtool/..., ./model/textparse, ./prompb/...]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: list_oldest_go_version
+  # NOTE: $GITHUB_ENV, $GITHUB_PATH and $GITHUB_OUTPUT are emulated with temp files, loaded before each step
+  list-oldest-go-version:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        export GITHUB_ENV=$(mktemp) GITHUB_PATH=$(mktemp) GITHUB_OUTPUT=$(mktemp) GITHUB_STEP_SUMMARY=/dev/null
+        trap 'rm -f "$GITHUB_ENV" "$GITHUB_PATH" "$GITHUB_OUTPUT"' EXIT
+        _gh_load() {
+          local l n d v x p
+          while IFS= read -r l; do
+            n=${l%%=*}
+            if [[ $n == *'<<'* ]]; then
+              n=${l%%<<*} d=${l#*<<} v=
+              while IFS= read -r x && [[ $x != "$d" ]]; do v+=${v:+$'\n'}$x; done
+              export "$n=$v"
+            elif [[ $l == *=* ]]; then
+              export "$n=${l#*=}"
+            fi
+          done <"$GITHUB_ENV"
+          while IFS= read -r p; do [[ -n $p ]] && PATH=$p:$PATH; done <"$GITHUB_PATH"
+        }
+        (
+          _gh_load
+        versions=$(curl -sSf 'https://go.dev/dl/?mode=json' \
+          | jq -c '[[.[].version | ltrimstr("go") | split(".")[1] | tonumber] | min | "1.\(.)"]')
+        echo "versions=$versions" >> "$GITHUB_OUTPUT"
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [CGO_ENABLED, GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  forcedirectio-race:
-    argv: [go, test, -count=1, -tags=forcedirectio, -race, ./tsdb/]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: test-compliance
+  # REVIEW: runs in a container (quay.io/prometheus/golang-builder:1.27-base): run the steps inside it, e.g. docker run, and fingerprint the image
+  # REVIEW: uses action prometheus/promci-setup@55bd31fe92710532260eb57c554f2697363285c5: no local equivalent known; reproduce it with commands
+  test-compliance:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        go test -v --tags=compliance ./compliance/...
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [CGO_ENABLED, GOFLAGS, TMPDIR]
-    reuse: { allowed: true, max_age: 72h }
-  test-386:
-    argv: [env, GOARCH=386, go, test, -count=1, -parallel=1, ./...]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: test_go
+  # REVIEW: runs in a container (quay.io/prometheus/golang-builder:1.27-base): run the steps inside it, e.g. docker run, and fingerprint the image
+  # REVIEW: uses action prometheus/promci-setup@55bd31fe92710532260eb57c554f2697363285c5: no local equivalent known; reproduce it with commands
+  test-go:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        make GO_ONLY=1 SKIP_GOLANGCI_LINT=1
+        )
+        (
+        go test ./tsdb/ -test.tsdb-isolation=false
+        )
+        (
+        make -C documentation/examples/remote_storage
+        )
+        (
+        make -C documentation/examples
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  golangci-lint:
-    argv: [bash, -o, pipefail, -c, "set -e; v=2.14.0; d=$HOME/.cache/cinema-lab-tools/golangci-lint-$v; if [ ! -x $d/golangci-lint ]; then mkdir -p $d; t=$(mktemp); curl -sSfL -o $t https://github.com/golangci/golangci-lint/releases/download/v$v/golangci-lint-$v-linux-amd64.tar.gz; echo \"ab90aeb7b066f92a33415b638a50fe5344bbb75a0d32ad30cc248d88f81032ab  $t\" | sha256sum -c --quiet; tar -xzf $t -C $d --strip-components=1; rm -f $t; fi; GOLANGCI_LINT_CACHE=$d/cache $d/golangci-lint run"]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: test_go_386
+  # REVIEW: runs in a container (quay.io/prometheus/golang-builder:1.27-base): run the steps inside it, e.g. docker run, and fingerprint the image
+  # REVIEW: uses action prometheus/promci-setup@55bd31fe92710532260eb57c554f2697363285c5: no local equivalent known; reproduce it with commands
+  test-go-386:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        GOARCH=386 go test -parallel=1 ./...
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  golangci-lint.slicelabels:
-    argv: [bash, -o, pipefail, -c, "set -e; v=2.14.0; d=$HOME/.cache/cinema-lab-tools/golangci-lint-$v; if [ ! -x $d/golangci-lint ]; then mkdir -p $d; t=$(mktemp); curl -sSfL -o $t https://github.com/golangci/golangci-lint/releases/download/v$v/golangci-lint-$v-linux-amd64.tar.gz; echo \"ab90aeb7b066f92a33415b638a50fe5344bbb75a0d32ad30cc248d88f81032ab  $t\" | sha256sum -c --quiet; tar -xzf $t -C $d --strip-components=1; rm -f $t; fi; GOLANGCI_LINT_CACHE=$d/cache $d/golangci-lint run --build-tags=slicelabels"]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: test_go_more
+  # REVIEW: runs in a container (quay.io/prometheus/golang-builder:1.27-base): run the steps inside it, e.g. docker run, and fingerprint the image
+  # REVIEW: uses action prometheus/promci-setup@55bd31fe92710532260eb57c554f2697363285c5: no local equivalent known; reproduce it with commands
+  test-go-more:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        go test --tags=dedupelabels ./...
+        )
+        (
+        go test --tags=slicelabels -race ./cmd/prometheus ./cmd/promtool/... ./model/textparse ./prompb/...
+        )
+        (
+        go test --tags=forcedirectio -race ./tsdb/
+        )
+        (
+        make protoc
+        )
+        (
+        make proto
+        )
+        (
+        git diff --exit-code
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  golangci-lint.dedupelabels:
-    argv: [bash, -o, pipefail, -c, "set -e; v=2.14.0; d=$HOME/.cache/cinema-lab-tools/golangci-lint-$v; if [ ! -x $d/golangci-lint ]; then mkdir -p $d; t=$(mktemp); curl -sSfL -o $t https://github.com/golangci/golangci-lint/releases/download/v$v/golangci-lint-$v-linux-amd64.tar.gz; echo \"ab90aeb7b066f92a33415b638a50fe5344bbb75a0d32ad30cc248d88f81032ab  $t\" | sha256sum -c --quiet; tar -xzf $t -C $d --strip-components=1; rm -f $t; fi; GOLANGCI_LINT_CACHE=$d/cache $d/golangci-lint run --build-tags=dedupelabels"]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: test_mixins
+  # REVIEW: runs in a container (quay.io/prometheus/golang-builder:1.27-base): run the steps inside it, e.g. docker run, and fingerprint the image
+  # REVIEW: a step fetches a floating version (@latest / HEAD / master): results can change without a source change
+  # REVIEW: a step fetches a floating version (@latest / HEAD / master): results can change without a source change
+  # REVIEW: a step fetches a floating version (@latest / HEAD / master): results can change without a source change
+  test-mixins:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        go install ./cmd/promtool/.
+        )
+        (
+        go install github.com/google/go-jsonnet/cmd/jsonnet@latest
+        )
+        (
+        go install github.com/google/go-jsonnet/cmd/jsonnetfmt@latest
+        )
+        (
+        go install github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb@latest
+        )
+        (
+        make -C documentation/prometheus-mixin clean
+        )
+        (
+        make -C documentation/prometheus-mixin jb_install
+        )
+        (
+        make -C documentation/prometheus-mixin
+        )
+        (
+        git diff --exit-code
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  generated-parser:
-    argv: [bash, -o, pipefail, -c, "set -e; d=$(mktemp -d); GOBIN=$d go install golang.org/x/tools/cmd/goyacc@v0.6.0; $d/goyacc -l -o promql/parser/generated_parser.y.go promql/parser/generated_parser.y; rm -rf $d; git diff --exit-code -- promql/parser/generated_parser.y.go"]
-    platform: any
-    toolchain: [{cmd: [go, version]}]
-    reuse: { allowed: true, max_age: 72h }
-  examples-syntax:
-    argv: [bash, -o, pipefail, -c, "set -e; d=$(mktemp -d); go build -o $d/promtool ./cmd/promtool; cd documentation/examples; for f in prometheus-*.yml; do $d/promtool check config --syntax-only $f; done; rm -rf $d"]
-    platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    reuse: { allowed: true, max_age: 72h }
-  compliance:
-    argv: [go, test, -count=1, -tags=compliance, ./compliance/...]
-    platform: linux/amd64
-    toolchain: [{cmd: [go, version]}]
-    env: [CGO_ENABLED, GOFLAGS]
-    reuse: { allowed: true, max_age: 72h }
-  ui:
-    argv: [env, CI=true, bash, -o, pipefail, -c, "make assets-tarball && make ui-lint && make ui-test"]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # ci.yml: test_ui
+  # REVIEW: runs in a container (quay.io/prometheus/golang-builder:1.27-base): run the steps inside it, e.g. docker run, and fingerprint the image
+  # REVIEW: uses action prometheus/promci-setup@55bd31fe92710532260eb57c554f2697363285c5: no local equivalent known; reproduce it with commands
+  # NOTE: outputs: are the paths the job uploads as artifacts; they're left out of the source fingerprint
+  test-ui:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        make assets-tarball
+        )
+        (
+        make ui-lint
+        )
+        (
+        make ui-test
+        )
     platform: linux/amd64
     outputs: [.tarballs]
-    toolchain: [{cmd: [go, version]}, {cmd: [node, --version]}]
-    reuse: { allowed: true, max_age: 72h }
-  # build job ("Build Prometheus for common architectures", 3 shards upstream): promu
-  # crossbuild of 6 platforms inside golang-builder. The image is pulled by a floating
-  # tag, so it's fingerprinted by its resolved digest (image: entry). UI assets are
-  # built first (upstream restores them from the UI job's artifact).
-  crossbuild:
-    argv: [bash, -o, pipefail, -c, "export CI=true; make promu && make assets && $(go env GOPATH)/bin/promu crossbuild -v --parallelism 6 -p linux/amd64 -p windows/amd64 -p linux/arm64 -p darwin/amd64 -p darwin/arm64 -p linux/386"]
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
+  # govulncheck.yml: govulncheck
+  # REVIEW: a step is conditional (if: github.repository == 'prometheus/snmp_exporter'); it is included unconditionally
+  # REVIEW: a step uses sudo (installs or changes the machine): make it a prerequisite of the evidence machine, not part of the task
+  # REVIEW: uses action golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f: no local equivalent known; reproduce it with commands
+  govulncheck:
+    argv:
+      - bash
+      - -eo
+      - pipefail
+      - -c
+      - |-
+        (
+        sudo apt-get update && sudo apt-get -y install libsnmp-dev
+        )
     platform: linux/amd64
-    toolchain: [{cmd: [go, version]}, {cmd: [node, --version]}, {image: quay.io/prometheus/golang-builder:1.27-base}]
-    env: [GOFLAGS]
-    exclusive: true                 # saturates every core for ~13 min: timing-sensitive tsdb/promql tests fail beside it (finding 33)
-    reuse: { allowed: true, max_age: 72h }
+    cpus: 4
+    timeout: 60m
+    reuse: {allowed: true, max_age: 24h}
